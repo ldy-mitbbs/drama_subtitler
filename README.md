@@ -124,9 +124,17 @@ Windows 自检：
 
 - `ffmpeg` 必须在 `PATH` 中（本地/远程 ASR 和内嵌字幕提取都需要）。
 - 如果要直接复用合法来源的 TS 文件里的 `[字]` 字幕，`ffmpeg` 还需要支持
-  `arib_caption` 解码。普通 Homebrew `ffmpeg` 可能没有这个解码器；macOS
-  可使用支持 `--with-libaribcaption` 的 ffmpeg 构建，或自行编译带
-  `libaribcaption` 的 ffmpeg。
+  `arib_caption` 解码。Homebrew 核心的 `ffmpeg` 没有这个解码器，macOS 上可以用
+  `homebrew-ffmpeg` tap 源码编译一份（约 1~2 分钟）：
+
+  ```bash
+  brew tap homebrew-ffmpeg/ffmpeg
+  brew uninstall --ignore-dependencies ffmpeg   # 两个 tap 的 ffmpeg 不能共存
+  brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libaribcaption
+  ffmpeg -hide_banner -decoders | grep arib     # 应出现 libaribcaption
+  ```
+
+  Linux/CI 可直接用 BtbN 的静态构建（见 `.github/workflows/ci.yml`）。
 - 使用 `whisper.cpp` 时：安装 `whisper-cli`，并将 ggml 模型放到 `models/ggml-<MODEL>.bin`、`~/.cache/media_subtitler/models/ggml-<MODEL>.bin`，或在设置里填写 `WHISPER_CPP_MODEL_PATH`。
 - 使用 `ollama` 时：需要运行中的 Ollama 守护进程（默认 `http://127.0.0.1:11434`，或由 `GPU_BASE_URL` 派生为 `<GPU_BASE_URL>:11434`）。
 - 使用 `lmstudio` 时：需要在目标机器上运行 LM Studio 并开启本地服务器（默认 `http://127.0.0.1:1234/v1`，或由 `GPU_BASE_URL` 派生为 `<GPU_BASE_URL>:1234/v1`），并在 LM Studio 里加载好对应模型（如 `qwen2.5-14b-instruct`）。无需 API Key。
