@@ -4,7 +4,12 @@ from pathlib import Path
 import pytest
 import requests
 
-from app.models.subtitle_pipeline import SubtitlePipeline
+from app.models.subtitle_pipeline import (
+    FatalTranslationError,
+    SubtitlePipeline,
+    _collapse_degenerate_repeats,
+    _translation_token_budget,
+)
 
 
 def _pipeline(**overrides):
@@ -113,13 +118,89 @@ def test_translate_with_recovery_splits_batch_on_timeout(mocker):
 def test_translate_chunk_accepts_zh_key(mocker):
     pipeline = _pipeline()
 
-    def fake_chat(messages, stream_cb=None, json_mode=False):
+    def fake_chat(messages, stream_cb=None, json_mode=False, max_tokens=None):
         return json.dumps({"items": [{"zh": "你好"}, {"target": "再见"}]})
 
     mocker.patch.object(pipeline, "_chat_completion", side_effect=fake_chat)
 
     out = pipeline._translate_chunk(["こんにちは", "さようなら"], source_language="ja")
     assert out == [{"target": "你好"}, {"target": "再见"}]
+
+
+def test_collapse_degenerate_repeats_tames_whisper_loop():
+    # Real failure: a 30s whisper segment came back as 洋館屋 + 97 more 屋, which
+    # made the translation model echo the loop until it hit max_tokens.
+    segments = [
+        {"start": 0.0, "end": 30.0, "text": "あの、洋館屋、洋館屋" + "屋" * 95},
+        {"start": 30.0, "end": 31.0, "text": "そっか" + "っ" * 88},
+    ]
+
+    out = _collapse_degenerate_repeats(segments)
+
+    assert out[0]["text"] == "あの、洋館屋、洋館屋屋"
+    assert out[1]["text"] == "そっか" + "っっ"
+
+
+def test_collapse_degenerate_repeats_leaves_real_dialogue_alone():
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "まあまあ、いいじゃない!!!"},
+        {"start": 1.0, "end": 2.0, "text": "そうそう"},
+    ]
+
+    out = _collapse_degenerate_repeats(segments)
+
+    assert [seg["text"] for seg in out] == [
+        "まあまあ、いいじゃない!!!",
+        "そうそう",
+    ]
+
+
+def test_translation_token_budget_is_bounded():
+    # Short lines get a small cap; nothing ever gets the provider's 8192 default.
+    assert _translation_token_budget(["こんにちは"]) < 512
+    assert _translation_token_budget(["あ" * 100000]) == 8192
+
+
+def test_translate_chunk_caps_output_tokens(mocker):
+    pipeline = _pipeline()
+    spy = mocker.patch.object(
+        pipeline,
+        "_chat_completion",
+        return_value=json.dumps({"items": [{"target": "你好"}]}),
+    )
+
+    pipeline._translate_chunk(["こんにちは"], source_language="ja")
+
+    assert spy.call_args.kwargs["max_tokens"] == _translation_token_budget(["こんにちは"])
+
+
+def test_fallback_keeps_source_text_when_a_single_line_wont_parse(mocker):
+    """One pathological line must not throw away the rest of the run."""
+    pipeline = _pipeline()
+
+    def translate_single(text, source_language, target_language=None, stream_cb=None):
+        if text == "bad":
+            raise ValueError("Model did not return valid JSON")
+        return {"target": f"zh:{text}"}
+
+    mocker.patch.object(pipeline, "_translate_single", side_effect=translate_single)
+
+    out = pipeline._fallback_translations(["a", "bad", "b"], source_language="ja")
+
+    assert out == [{"target": "zh:a"}, {"target": ""}, {"target": "zh:b"}]
+    assert pipeline._translation_error_count == 1
+
+
+def test_fallback_still_aborts_once_the_error_budget_is_spent(mocker):
+    pipeline = _pipeline(TRANSLATION_ERROR_BUDGET=2)
+    mocker.patch.object(
+        pipeline,
+        "_translate_single",
+        side_effect=ValueError("Model did not return valid JSON"),
+    )
+
+    with pytest.raises(FatalTranslationError):
+        pipeline._fallback_translations(["a", "b", "c"], source_language="ja")
 
 
 def test_unsupported_translation_backend_raises():

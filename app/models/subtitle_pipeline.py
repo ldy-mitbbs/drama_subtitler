@@ -238,6 +238,42 @@ def _dedupe_repeated_segments(segments):
     return cleaned
 
 
+# Whisper's repetition loop can also stay *inside* one segment: a 30s segment
+# (its max length) comes back as "洋館屋屋屋屋屋…" with the same unit repeated
+# a hundred times. Left alone it poisons translation too -- the LLM happily
+# echoes the loop until it hits max_tokens, so the reply is a truncated,
+# unparseable JSON blob and the whole job dies on one bad line.
+_DEGENERATE_RUN_RE = re.compile(r"(.{1,8}?)\1{3,}")
+
+
+def _collapse_degenerate_repeats(segments):
+    """Collapse a unit repeated 4+ times inside one segment down to 2 copies.
+
+    Deliberately conservative: real dialogue does repeat ("まあまあ", "www",
+    "!!!"), so we only touch runs of four or more and keep two.
+    """
+    for segment in segments:
+        text = segment.get("text") or ""
+        if not text:
+            continue
+        collapsed = _DEGENERATE_RUN_RE.sub(lambda m: m.group(1) * 2, text)
+        if collapsed != text:
+            segment["text"] = collapsed
+    return segments
+
+
+def _translation_token_budget(texts):
+    """Output-token cap for one translation request.
+
+    Without a cap, a model that starts echoing a repetitive line burns the
+    provider's full default (8192 on DeepSeek) before returning a truncated,
+    unparseable reply. Sized generously -- a translation that legitimately
+    needs more than this is not a translation.
+    """
+    chars = sum(len(t or "") for t in texts)
+    return max(256, min(8192, chars * 4 + len(texts) * 64 + 256))
+
+
 def write_srt(segments, output_path):
     with open(output_path, "w", encoding="utf-8") as f:
         for idx, segment in enumerate(segments, start=1):
@@ -779,6 +815,7 @@ class SubtitlePipeline:
             segments = read_srt(original_srt)
             segments = self._repair_mojibake_segments(segments)
             segments = _dedupe_repeated_segments(segments)
+            segments = _collapse_degenerate_repeats(segments)
             source_language = source_language_hint or "unknown"
             if not segments:
                 raise RuntimeError(f"No subtitle segments found in: {original_srt}")
@@ -814,6 +851,7 @@ class SubtitlePipeline:
                 else:
                     segments = self._repair_mojibake_segments(segments)
                     segments = _dedupe_repeated_segments(segments)
+                    segments = _collapse_degenerate_repeats(segments)
                     if progress_cb:
                         progress_cb(
                             55,
@@ -1013,6 +1051,7 @@ class SubtitlePipeline:
 
         segments = self._repair_mojibake_segments(segments)
         segments = _dedupe_repeated_segments(segments)
+        segments = _collapse_degenerate_repeats(segments)
         if progress_cb:
             progress_cb(55, f"OpenRouter transcription complete ({len(segments)} segments)")
         return segments, source_language
@@ -1072,6 +1111,7 @@ class SubtitlePipeline:
 
         segments = self._repair_mojibake_segments(segments)
         segments = _dedupe_repeated_segments(segments)
+        segments = _collapse_degenerate_repeats(segments)
         if progress_cb:
             progress_cb(55, f"Qwen3-ASR transcription complete ({len(segments)} segments)")
         return segments, source_language
@@ -1596,6 +1636,7 @@ class SubtitlePipeline:
         source_language = payload.get("language", language_hint or "unknown")
         segments = self._repair_mojibake_segments(segments)
         segments = _dedupe_repeated_segments(segments)
+        segments = _collapse_degenerate_repeats(segments)
         if progress_cb:
             elapsed = payload.get("elapsed_seconds")
             progress_cb(
@@ -1759,6 +1800,7 @@ class SubtitlePipeline:
             source_language = payload.get("result", {}).get("language", language_hint or "unknown")
             segments = self._repair_mojibake_segments(segments)
             segments = _dedupe_repeated_segments(segments)
+            segments = _collapse_degenerate_repeats(segments)
             return segments, source_language
 
     @staticmethod
@@ -2143,6 +2185,7 @@ class SubtitlePipeline:
             source_language = payload.get("language", language_hint or "unknown")
             segments = self._repair_mojibake_segments(segments)
             segments = _dedupe_repeated_segments(segments)
+            segments = _collapse_degenerate_repeats(segments)
             return segments, source_language
 
     # --------------------------------------------------------------- translation
@@ -2370,7 +2413,10 @@ class SubtitlePipeline:
         ]
 
         content = self._chat_completion(
-            messages, stream_cb=stream_cb, json_mode=self._json_mode_enabled
+            messages,
+            stream_cb=stream_cb,
+            json_mode=self._json_mode_enabled,
+            max_tokens=_translation_token_budget(texts),
         )
         parsed = self._extract_json(content)
 
@@ -2393,7 +2439,14 @@ class SubtitlePipeline:
     def _fallback_translations(
         self, texts, source_language, target_language=None, stream_cb=None, error_cb=None
     ):
-        """Translate one line at a time. Errors propagate (no source-text fallback)."""
+        """Translate one line at a time -- the last resort after halving.
+
+        A line that still fails here is left untranslated (empty target, which
+        the caller renders as the source text) instead of killing the run: one
+        pathological line should not throw away the hundreds of lines already
+        translated. Every failure still spends error budget, so a model that is
+        broken rather than merely confused by one line aborts as before.
+        """
         results = []
         target_lang = target_language or self.target_language
         for text in texts:
@@ -2420,17 +2473,21 @@ class SubtitlePipeline:
                         f"Translation API returned unrecoverable HTTP {status}: {body[:200]}"
                     ) from exc
                 if error_cb:
-                    error_cb(f"  \u26a0 single-line translation failed (HTTP {status})")
+                    error_cb(
+                        f"  \u26a0 single-line translation failed (HTTP {status}); "
+                        "keeping source text for this line"
+                    )
+                # Raises FatalTranslationError once the error budget is spent.
                 self._note_translation_error()
-                # _note_translation_error raises FatalTranslationError once the
-                # error budget is exhausted; otherwise re-raise the underlying
-                # HTTP error so we don't silently leave a line untranslated.
-                raise
+                results.append({"target": ""})
             except Exception as exc:
                 if error_cb:
-                    error_cb(f"  \u26a0 single-line translation failed ({type(exc).__name__}): {exc}")
+                    error_cb(
+                        f"  \u26a0 single-line translation failed ({type(exc).__name__}): {exc}; "
+                        "keeping source text for this line"
+                    )
                 self._note_translation_error()
-                raise
+                results.append({"target": ""})
         return results
 
     def _translate_single(self, text, source_language, target_language=None, stream_cb=None):
@@ -2450,7 +2507,10 @@ class SubtitlePipeline:
         ]
 
         content = self._chat_completion(
-            messages, stream_cb=stream_cb, json_mode=self._json_mode_enabled
+            messages,
+            stream_cb=stream_cb,
+            json_mode=self._json_mode_enabled,
+            max_tokens=_translation_token_budget([text]),
         )
         parsed = self._extract_json(content)
         if isinstance(parsed, dict):
@@ -2465,22 +2525,25 @@ class SubtitlePipeline:
 
     # ----------------------------------------------------------- chat completion
 
-    def _chat_completion(self, messages, stream_cb=None, json_mode=False):
+    def _chat_completion(self, messages, stream_cb=None, json_mode=False, max_tokens=None):
+        kwargs = {"stream_cb": stream_cb, "json_mode": json_mode, "max_tokens": max_tokens}
         if self.translation_backend == "openrouter":
-            return self._chat_completion_openrouter(messages, stream_cb=stream_cb, json_mode=json_mode)
+            return self._chat_completion_openrouter(messages, **kwargs)
         if self.translation_backend == "deepseek":
-            return self._chat_completion_deepseek(messages, stream_cb=stream_cb, json_mode=json_mode)
+            return self._chat_completion_deepseek(messages, **kwargs)
         if self.translation_backend == "lmstudio":
-            return self._chat_completion_lmstudio(messages, stream_cb=stream_cb, json_mode=json_mode)
-        return self._chat_completion_ollama(messages, stream_cb=stream_cb, json_mode=json_mode)
+            return self._chat_completion_lmstudio(messages, **kwargs)
+        return self._chat_completion_ollama(messages, **kwargs)
 
-    def _chat_completion_ollama(self, messages, stream_cb=None, json_mode=False):
+    def _chat_completion_ollama(self, messages, stream_cb=None, json_mode=False, max_tokens=None):
         payload = {
             "model": self.translation_model,
             "stream": bool(stream_cb),
             "messages": messages,
             "options": {"temperature": 0.2, "top_p": 0.9, "repeat_penalty": 1.05},
         }
+        if max_tokens:
+            payload["options"]["num_predict"] = int(max_tokens)
         if json_mode:
             payload["format"] = "json"
 
@@ -2515,7 +2578,7 @@ class SubtitlePipeline:
         self._record_usage(usage)
         return data.get("message", {}).get("content", "")
 
-    def _chat_completion_openrouter(self, messages, stream_cb=None, json_mode=False):
+    def _chat_completion_openrouter(self, messages, stream_cb=None, json_mode=False, max_tokens=None):
         if not self.openrouter_api_key:
             raise RuntimeError(
                 "OPENROUTER_API_KEY is not set. Export it in the environment to use the openrouter backend."
@@ -2532,9 +2595,10 @@ class SubtitlePipeline:
             messages=messages,
             stream_cb=stream_cb,
             json_mode=json_mode,
+            max_tokens=max_tokens,
         )
 
-    def _chat_completion_lmstudio(self, messages, stream_cb=None, json_mode=False):
+    def _chat_completion_lmstudio(self, messages, stream_cb=None, json_mode=False, max_tokens=None):
         # LM Studio exposes an OpenAI-compatible server (default :1234/v1) and
         # ignores the bearer token unless the user enabled API tokens, so any
         # non-empty placeholder works. Runs entirely on the local/LAN GPU box,
@@ -2546,9 +2610,10 @@ class SubtitlePipeline:
             messages=messages,
             stream_cb=stream_cb,
             json_mode=json_mode,
+            max_tokens=max_tokens,
         )
 
-    def _chat_completion_deepseek(self, messages, stream_cb=None, json_mode=False):
+    def _chat_completion_deepseek(self, messages, stream_cb=None, json_mode=False, max_tokens=None):
         if not self.deepseek_api_key:
             raise RuntimeError(
                 "DEEPSEEK_API_KEY is not set. Export it in the environment to use the deepseek backend."
@@ -2568,6 +2633,7 @@ class SubtitlePipeline:
             messages=messages,
             stream_cb=stream_cb,
             json_mode=json_mode,
+            max_tokens=max_tokens,
             extra_payload=extra_payload or None,
         )
 
@@ -2580,6 +2646,7 @@ class SubtitlePipeline:
         messages,
         stream_cb=None,
         json_mode=False,
+        max_tokens=None,
         extra_payload=None,
     ):
         headers = {
@@ -2598,6 +2665,8 @@ class SubtitlePipeline:
         }
         if stream_cb:
             payload["stream_options"] = {"include_usage": True}
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         if extra_payload:
